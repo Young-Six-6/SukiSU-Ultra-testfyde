@@ -1,0 +1,105 @@
+name: Build KSU LKM for FydeOS (ChromeOS 6.6)
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - ".github/workflows/build-ksu-fydeos-6.6.yml"
+      - "kernel/**"
+  workflow_dispatch:
+
+env:
+  git_tag: chromeos-6.6
+  arch: x86_64
+
+jobs:
+  build-ksu-ko:
+    name: Build KSU LKM for FydeOS (6.6.x)
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Install Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ca-certificates flex git gnupg \
+            libelf-dev libssl-dev lsb-release wget libncurses-dev \
+            rsync python3 device-tree-compiler
+
+          export LLVM_VERSION=16
+          wget https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh $LLVM_VERSION
+          rm ./llvm.sh
+
+          sudo ln -s /usr/bin/clang-$LLVM_VERSION /usr/bin/clang
+          sudo ln -s /usr/bin/ld.lld-$LLVM_VERSION /usr/bin/ld.lld
+          sudo ln -s /usr/bin/llvm-objcopy-$LLVM_VERSION /usr/bin/llvm-objcopy
+          sudo ln -s /usr/bin/clang++-$LLVM_VERSION /usr/bin/clang++
+
+      - name: Checkout KernelSU Source
+        uses: actions/checkout@v4
+        with:
+          repository: tiann/KernelSU
+          ref: main
+          path: KernelSU
+          fetch-depth: 1
+
+      - name: Clone ChromeOS 6.6 Kernel Source
+        id: kernel_source
+        run: |
+          git clone https://chromium.googlesource.com/chromiumos/third_party/kernel \
+            -b ${{ env.git_tag }} kernel
+          cd kernel
+          VERSION=$(grep '^VERSION = ' Makefile | awk '{print $3}')
+          PATCHLEVEL=$(grep '^PATCHLEVEL = ' Makefile | awk '{print $3}')
+          SUBLEVEL=$(grep '^SUBLEVEL = ' Makefile | awk '{print $3}')
+          echo "kernel_version=$VERSION.$PATCHLEVEL.$SUBLEVEL" >> $GITHUB_ENV
+          echo "::set-output name=version::$VERSION.$PATCHLEVEL.$SUBLEVEL"
+
+      - name: Integrate KernelSU into Kernel
+        working-directory: kernel
+        run: |
+          ln -sf $GITHUB_WORKSPACE/KernelSU/kernel drivers/kernelsu
+
+          # 确保KSU配置正确注入
+          sed -i '/endmenu/i\\nsource "drivers/kernelsu/Kconfig"' drivers/Kconfig
+          echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
+
+          # 禁用版本脏标记
+          sed -i 's/-dirty//g' scripts/setlocalversion
+
+      - name: Configure Kernel for Module Build
+        working-directory: kernel
+        run: |
+          make LLVM=1 LLVM_IAS=1 x86_64_defconfig
+
+          # 强制启用必要配置选项
+          ./scripts/config --set-val CONFIG_KSU y
+          ./scripts/config --set-val CONFIG_MODULES y
+          ./scripts/config --set-val CONFIG_MODULE_UNLOAD y
+          ./scripts/config --set-val CONFIG_OVERLAY_FS y
+          ./scripts/config --set-val CONFIG_KALLSYMS y
+          ./scripts/config --set-val CONFIG_KALLSYMS_ALL y
+
+          # 应用配置变更
+          make LLVM=1 LLVM_IAS=1 olddefconfig
+
+      - name: Build KSU Kernel Module (ko)
+        working-directory: kernel
+        id: build_module
+        run: |
+          make LLVM=1 LLVM_IAS=1 -j$(nproc) drivers/kernelsu/
+          
+          if [ -f drivers/kernelsu/ksu.ko ]; then
+            echo "::notice title=BuildSuccess::KSU module built successfully"
+            echo "ko_path=drivers/kernelsu/ksu.ko" >> $GITHUB_OUTPUT
+          else
+            echo "::error title=BuildFailed::KSU module not found!"
+            exit 1
+          fi
+
+      - name: Upload KSU ko Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ksu-fydeos-${{ env.arch }}-${{ env.kernel_version }}
+          path: kernel/${{ steps.build_module.outputs.ko_path }}
+          retention-days: 30
