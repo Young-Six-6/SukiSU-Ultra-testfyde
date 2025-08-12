@@ -1,107 +1,127 @@
-name: Build KSU LKM for FydeOS (ChromeOS 6.6)
+name: Build KernelSU LKM for FydeOS (x86_64)
+
 on:
+  workflow_dispatch:
   push:
     branches: ["main"]
     paths:
-      - ".github/workflows/build-ksu-fydeos-6.6.yml"
+      - ".github/workflows/build-kernel-fydeos-lkm.yml"
       - "kernel/**"
-  workflow_dispatch:
+  pull_request:
+    branches: ["main"]
+    paths:
+      - ".github/workflows/build-kernel-fydeos-lkm.yml"
+      - "kernel/**"
 
 env:
-  git_tag: chromeos-6.6
-  arch: x86_64
+  git_tag: chromeos-5.15  # FydeOS基于的内核分支
+  ARCH: x86_64
+  MODULE_NAME: kernelsu.ko  # 目标模块文件名
 
 jobs:
-  build-ksu-ko:
-    name: Build KSU LKM for FydeOS (6.6.x)
-    runs-on: ubuntu-22.04
+  build-lkm:
+    name: Build FydeOS LKM (${{ env.ARCH }})
+    runs-on: ubuntu-20.04  # 保持与原工作流一致的环境
+    env:
+      KERNEL_DIR: ${{ github.workspace }}/kernel
+      KSU_DIR: ${{ github.workspace }}/KernelSU
+      OUTPUT_DIR: ${{ github.workspace }}/output
+
     steps:
       - name: Install Build Dependencies
         run: |
           sudo apt-get update
+          # 基础编译工具
           sudo apt-get install -y --no-install-recommends \
             bc bison build-essential ca-certificates flex git gnupg \
             libelf-dev libssl-dev lsb-release wget libncurses-dev \
             rsync python3 device-tree-compiler
+          # 模块编译依赖（参考GKI工作流）
+          sudo apt-get install -y llvm-14 clang-14  # 与原工作流LLVM版本保持一致
+          # 符号处理工具
+          pip install ast-grep-cli
+          # 工具链软链接
+          sudo ln -s --force /usr/bin/clang-14 /usr/bin/clang
+          sudo ln -s --force /usr/bin/ld.lld-14 /usr/bin/ld.lld
+          sudo ln -s --force /usr/bin/llvm-strip-14 /usr/bin/llvm-strip
+          sudo ln -s --force python3 /usr/bin/python
 
-          export LLVM_VERSION=16
-          wget https://apt.llvm.org/llvm.sh
-          chmod +x llvm.sh
-          sudo ./llvm.sh $LLVM_VERSION
-          rm ./llvm.sh
-
-          # 补充llvm-ar的软链接，修复工具缺失问题
-          sudo ln -sf /usr/bin/clang-$LLVM_VERSION /usr/bin/clang
-          sudo ln -sf /usr/bin/ld.lld-$LLVM_VERSION /usr/bin/ld.lld
-          sudo ln -sf /usr/bin/llvm-objcopy-$LLVM_VERSION /usr/bin/llvm-objcopy
-          sudo ln -sf /usr/bin/clang++-$LLVM_VERSION /usr/bin/clang++
-          sudo ln -sf /usr/bin/llvm-ar-$LLVM_VERSION /usr/bin/llvm-ar  # 新增这一行
-
-      - name: Checkout KernelSU Source
+      - name: Checkout KernelSU源码
         uses: actions/checkout@v4
         with:
-          repository: tiann/KernelSU
-          ref: main
           path: KernelSU
-          fetch-depth: 1
+          ref: main
+          fetch-depth: 0
 
-      - name: Clone ChromeOS 6.6 Kernel Source
-        id: kernel_source
+      - name: 拉取FydeOS内核源码
         run: |
-          git clone https://chromium.googlesource.com/chromiumos/third_party/kernel \
-            -b ${{ env.git_tag }} kernel
+          git clone https://chromium.googlesource.com/chromiumos/third_party/kernel -b ${{ env.git_tag }}
           cd kernel
-          VERSION=$(grep '^VERSION = ' Makefile | awk '{print $3}')
-          PATCHLEVEL=$(grep '^PATCHLEVEL = ' Makefile | awk '{print $3}')
-          SUBLEVEL=$(grep '^SUBLEVEL = ' Makefile | awk '{print $3}')
+          # 提取内核版本信息
+          VERSION=$(grep -E '^VERSION = ' Makefile | awk '{print $3}')
+          PATCHLEVEL=$(grep -E '^PATCHLEVEL = ' Makefile | awk '{print $3}')
+          SUBLEVEL=$(grep -E '^SUBLEVEL = ' Makefile | awk '{print $3}')
+          echo "内核版本: $VERSION.$PATCHLEVEL.$SUBLEVEL"
           echo "kernel_version=$VERSION.$PATCHLEVEL.$SUBLEVEL" >> $GITHUB_ENV
-          echo "::set-output name=version::$VERSION.$PATCHLEVEL.$SUBLEVEL"
 
-      - name: Integrate KernelSU into Kernel
-        working-directory: kernel
+      - name: 配置KernelSU为模块（LKM）
+        working-directory: ${{ env.KERNEL_DIR }}
         run: |
-          ln -sf $GITHUB_WORKSPACE/KernelSU/kernel drivers/kernelsu
+          # 1. 链接KernelSU驱动到内核源码
+          ln -sf ${{ env.KSU_DIR }}/kernel drivers/kernelsu
 
-          # 确保KSU配置正确注入
-          sed -i '/endmenu/i\\nsource "drivers/kernelsu/Kconfig"' drivers/Kconfig
-          echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
-
-          # 禁用版本脏标记
-          sed -i 's/-dirty//g' scripts/setlocalversion
-
-      - name: Configure Kernel for Module Build
-        working-directory: kernel
-        run: |
-          make LLVM=1 LLVM_IAS=1 x86_64_defconfig
-
-          # 强制启用必要配置选项
-          ./scripts/config --set-val CONFIG_KSU y
-          ./scripts/config --set-val CONFIG_MODULES y
-          ./scripts/config --set-val CONFIG_MODULE_UNLOAD y
-          ./scripts/config --set-val CONFIG_OVERLAY_FS y
-          ./scripts/config --set-val CONFIG_KALLSYMS y
-          ./scripts/config --set-val CONFIG_KALLSYMS_ALL y
-
-          # 应用配置变更
-          make LLVM=1 LLVM_IAS=1 olddefconfig
-
-      - name: Build KSU Kernel Module (ko)
-        working-directory: kernel
-        id: build_module
-        run: |
-          make LLVM=1 LLVM_IAS=1 -j$(nproc) drivers/kernelsu/
-          
-          if [ -f drivers/kernelsu/ksu.ko ]; then
-            echo "::notice title=BuildSuccess::KSU module built successfully"
-            echo "ko_path=drivers/kernelsu/ksu.ko" >> $GITHUB_OUTPUT
-          else
-            echo "::error title=BuildFailed::KSU module not found!"
-            exit 1
+          # 2. 修改驱动Makefile和Kconfig
+          DRIVER_MAKEFILE=drivers/Makefile
+          DRIVER_KCONFIG=drivers/Kconfig
+          # 确保Makefile包含KernelSU
+          if ! grep -q "kernelsu" "$DRIVER_MAKEFILE"; then
+            echo -e "\nobj-\$(CONFIG_KSU) += kernelsu/" >> "$DRIVER_MAKEFILE"
+          fi
+          # 确保Kconfig包含KernelSU
+          if ! grep -q "kernelsu" "$DRIVER_KCONFIG"; then
+            sed -i "/endmenu/i\\source \"drivers/kernelsu/Kconfig\"" "$DRIVER_KCONFIG"
           fi
 
-      - name: Upload KSU ko Artifact
+          # 3. 修改Kconfig，将KernelSU设为模块（关键步骤）
+          # 将CONFIG_KSU的默认值从"y"改为"m"（模块）
+          sed -i '/config KSU/,/help/ s/default y/default m/' drivers/kernelsu/Kconfig
+
+          # 4. 处理模块符号检查（避免因未知符号报错）
+          # 修改modpost.c，跳过符号检查（参考GKI工作流）
+          if [ -f scripts/mod/modpost.c ]; then
+            ast-grep -U -p '$$$ check_exports($$$) {$$$}' -r '' scripts/mod/modpost.c
+            ast-grep -U -p 'check_exports($$$);' -r '' scripts/mod/modpost.c
+          fi
+
+      - name: 配置内核编译选项
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          # 加载默认配置
+          make LLVM=1 LLVM_IAS=1 O=${PWD} mrproper
+          make LLVM=1 LLVM_IAS=1 O=${PWD} x86_64_defconfig < /dev/null
+
+          # 启用模块支持（确保CONFIG_MODULES已开启）
+          scripts/config --file .config -e MODULES
+          # 启用LTO（与原工作流保持一致）
+          scripts/config --file .config -e LTO_CLANG -d LTO_NONE -e LTO_CLANG_THIN
+          # 禁用签名检查（避免模块加载时验证失败）
+          scripts/config --file .config -d MODULE_SIG -d MODULE_SIG_ALL
+
+      - name: 编译KernelSU模块（ko文件）
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          # 编译模块（仅编译KernelSU相关，加速构建）
+          make LLVM=1 LLVM_IAS=1 O=${PWD} -j$(nproc) drivers/kernelsu/
+          # 验证ko文件是否生成
+          ls -l drivers/kernelsu/${{ env.MODULE_NAME }} || { echo "模块编译失败"; exit 1; }
+          # 创建输出目录
+          mkdir -p ${{ env.OUTPUT_DIR }}
+          # 拷贝ko文件到输出目录，并添加版本信息
+          cp drivers/kernelsu/${{ env.MODULE_NAME }} \
+             ${{ env.OUTPUT_DIR }}/kernelsu-fydeos-${{ env.ARCH }}-${{ env.kernel_version }}.ko
+
+      - name: 上传模块 artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ksu-fydeos-${{ env.arch }}-${{ env.kernel_version }}
-          path: kernel/${{ steps.build_module.outputs.ko_path }}
-          retention-days: 30
+          name: lkm-fydeos-${{ env.ARCH }}-${{ env.kernel_version }}
+          path: ${{ env.OUTPUT_DIR }}/*.ko
