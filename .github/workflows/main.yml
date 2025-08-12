@@ -1,4 +1,4 @@
-name: Build KernelSU LKM for FydeOS (x86_64)
+name: Build KSU LKM for FydeOS (ChromeOS 6.6)
 
 on:
   workflow_dispatch:
