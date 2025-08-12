@@ -30,10 +30,11 @@ jobs:
           sudo ./llvm.sh $LLVM_VERSION
           rm ./llvm.sh
 
-          sudo ln -s /usr/bin/clang-$LLVM_VERSION /usr/bin/clang
-          sudo ln -s /usr/bin/ld.lld-$LLVM_VERSION /usr/bin/ld.lld
-          sudo ln -s /usr/bin/llvm-objcopy-$LLVM_VERSION /usr/bin/llvm-objcopy
-          sudo ln -s /usr/bin/clang++-$LLVM_VERSION /usr/bin/clang++
+          # 关键修复：添加-f参数强制覆盖现有软链接
+          sudo ln -sf /usr/bin/clang-$LLVM_VERSION /usr/bin/clang
+          sudo ln -sf /usr/bin/ld.lld-$LLVM_VERSION /usr/bin/ld.lld
+          sudo ln -sf /usr/bin/llvm-objcopy-$LLVM_VERSION /usr/bin/llvm-objcopy
+          sudo ln -sf /usr/bin/clang++-$LLVM_VERSION /usr/bin/clang++
 
       - name: Checkout KernelSU Source
         uses: actions/checkout@v4
